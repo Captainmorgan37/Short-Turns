@@ -179,6 +179,9 @@ def _normalise_flights(flights):
         "offBlock",
         "offBlockActual",
         "offBlockScheduled",
+        "blockOffEstUTC",
+        "blockOffEstLocal",
+        "blocksoffestimated",
         "departureScheduledTime",
         "departureActualTime",
         "departureTimeScheduled",
@@ -205,6 +208,9 @@ def _normalise_flights(flights):
         "onBlock",
         "onBlockActual",
         "onBlockScheduled",
+        "blockOnEstUTC",
+        "blockOnEstLocal",
+        "blocksonestimated",
         "arrivalScheduledTime",
         "arrivalActualTime",
         "arrivalTimeScheduled",
@@ -245,6 +251,8 @@ def _normalise_flights(flights):
         "departure.icao",
         "departure.airport",
         "departureStation",
+        "airportFrom",
+        "realAirportFrom",
     ]
 
     arr_airport_keys = [
@@ -256,6 +264,8 @@ def _normalise_flights(flights):
         "arrival.icao",
         "arrival.airport",
         "arrivalStation",
+        "airportTo",
+        "realAirportTo",
     ]
 
     leg_id_keys = [
