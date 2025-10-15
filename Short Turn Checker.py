@@ -269,6 +269,8 @@ def _normalise_flights(flights):
     ]
 
     leg_id_keys = [
+        "bookingIdentifier",
+        "booking.identifier",
         "flightId",
         "id",
         "uuid",
@@ -451,7 +453,7 @@ def load_uploaded(file) -> pd.DataFrame:
     arr_ap_col = pick("arr_airport", "arrivalairporticao", "arricao", "arrival")
     dep_off_col = pick("dep_offblock", "scheduledout", "outtime", "offblock")
     arr_on_col = pick("arr_onblock", "scheduledin", "intime", "onblock")
-    leg_id_col = pick("leg_id", "id", "legid", "uuid")
+    leg_id_col = pick("leg_id", "bookingidentifier", "id", "legid", "uuid")
 
     df = pd.DataFrame({
         "tail": raw[tail_col] if tail_col else None,
@@ -575,14 +577,21 @@ if source != "FL3XX API":
     st.session_state.pop("fl3xx_last_metadata", None)
 
 if source == "FL3XX API":
-    st.sidebar.subheader("FL3XX Auth")
     default_token = ""
     if "fl3xx_api" in st.secrets:
         default_token = st.secrets["fl3xx_api"].get("api_token", "")
     if not default_token:
         default_token = st.secrets.get("FL3XX_TOKEN", "")
-    token = st.sidebar.text_input("API Token (or set ST_SECRETS)", value=default_token, type="password")
-    fetch_btn = st.sidebar.button("Fetch from FL3XX", type="primary")
+
+    token = default_token
+    if not token:
+        st.sidebar.warning(
+            "Configure an FL3XX API token in Streamlit secrets to enable fetching."
+        )
+
+    fetch_btn = st.sidebar.button(
+        "Fetch from FL3XX", type="primary", disabled=not bool(token)
+    )
     if fetch_btn:
         legs_df = fetch_fl3xx_legs(token, start_utc, end_utc)
         if legs_df.empty:
@@ -657,6 +666,14 @@ if not legs_df.empty:
     else:
         # Nice column formatting
         col_config = {
+            "arr_leg_id": st.column_config.TextColumn(
+                "Arrival Booking",
+                help="Booking identifier for the arrival leg",
+            ),
+            "dep_leg_id": st.column_config.TextColumn(
+                "Departure Booking",
+                help="Booking identifier for the departure leg",
+            ),
             "arr_onblock": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
             "dep_offblock": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
             "turn_min": st.column_config.NumberColumn(
