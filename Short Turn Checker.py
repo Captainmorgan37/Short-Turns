@@ -148,6 +148,19 @@ def _extract_field(payload: dict, options):
 
 
 def _normalise_flights(flights):
+    """Return a dataframe of legs and diagnostics about skipped flights."""
+
+    stats = {
+        "raw_count": 0,
+        "normalised": 0,
+        "skipped_non_mapping": 0,
+        "skipped_missing_tail": 0,
+        "skipped_missing_airports": 0,
+        "skipped_missing_dep_airport": 0,
+        "skipped_missing_arr_airport": 0,
+        "skipped_missing_times": 0,
+    }
+
     dep_time_keys = [
         "scheduledOut",
         "actualOut",
@@ -243,7 +256,9 @@ def _normalise_flights(flights):
 
     rows = []
     for flight in flights:
+        stats["raw_count"] += 1
         if not isinstance(flight, dict):
+            stats["skipped_non_mapping"] += 1
             continue
         tail = _extract_field(flight, tail_keys)
         dep_ap = _extract_field(flight, dep_airport_keys)
@@ -259,7 +274,20 @@ def _normalise_flights(flights):
         if arr_ap:
             arr_ap = arr_ap.upper()
 
-        if not tail or not dep_ap or not arr_ap:
+        if not tail:
+            stats["skipped_missing_tail"] += 1
+            continue
+
+        missing_airport = False
+        if not dep_ap:
+            stats["skipped_missing_dep_airport"] += 1
+            missing_airport = True
+        if not arr_ap:
+            stats["skipped_missing_arr_airport"] += 1
+            missing_airport = True
+
+        if missing_airport:
+            stats["skipped_missing_airports"] += 1
             continue
 
         if dep_time is pd.NaT:
@@ -268,6 +296,7 @@ def _normalise_flights(flights):
             arr_time = None
 
         if dep_time is None and arr_time is None:
+            stats["skipped_missing_times"] += 1
             continue
 
         rows.append(
@@ -281,7 +310,9 @@ def _normalise_flights(flights):
             }
         )
 
-    return pd.DataFrame(rows)
+        stats["normalised"] += 1
+
+    return pd.DataFrame(rows), stats
 
 
 def _extract_datetime(payload: dict, options):
@@ -362,9 +393,15 @@ def fetch_fl3xx_legs(token: str, start_utc: datetime, end_utc: datetime) -> pd.D
         st.error(f"FL3XX fetch failed: {exc}")
         return pd.DataFrame()
 
-    st.session_state["fl3xx_last_metadata"] = {"count": len(flights), **metadata}
+    legs_df, normalise_stats = _normalise_flights(flights)
 
-    return _normalise_flights(flights)
+    st.session_state["fl3xx_last_metadata"] = {
+        "count": len(flights),
+        **metadata,
+        "normalisation": normalise_stats,
+    }
+
+    return legs_df
 
 # ----------------------------
 # Upload parser (CSV/JSON) — expects the columns listed above, but will try to infer
@@ -524,10 +561,54 @@ if source == "FL3XX API":
     if fetch_btn:
         legs_df = fetch_fl3xx_legs(token, start_utc, end_utc)
         if legs_df.empty:
-            st.warning(
+            message = (
                 "No legs returned. Check your endpoint/mapping and date range "
                 f"({window_label})."
             )
+            metadata = st.session_state.get("fl3xx_last_metadata", {})
+            stats = metadata.get("normalisation", {})
+            raw_count = stats.get("raw_count")
+            normalised = stats.get("normalised")
+
+            if raw_count:
+                parts = [
+                    f"The API returned {raw_count} flight{'s' if raw_count != 1 else ''}"
+                ]
+                if normalised is not None:
+                    parts.append(
+                        f"but {normalised} could be converted into legs"
+                    )
+
+                reasons = []
+
+                def _format_reason(key, description):
+                    count = stats.get(key, 0)
+                    if not count:
+                        return None
+                    suffix = "s" if count != 1 else ""
+                    return f"{count} flight{suffix} {description}"
+
+                for key, desc in (
+                    ("skipped_missing_tail", "were missing tail numbers"),
+                    ("skipped_missing_dep_airport", "were missing departure airports"),
+                    ("skipped_missing_arr_airport", "were missing arrival airports"),
+                    (
+                        "skipped_missing_times",
+                        "were missing both departure and arrival times",
+                    ),
+                    ("skipped_non_mapping", "had an unexpected format"),
+                ):
+                    reason = _format_reason(key, desc)
+                    if reason:
+                        reasons.append(reason)
+
+                details = ". ".join(parts)
+                if reasons:
+                    details += ". Flights were skipped because " + ", ".join(reasons)
+
+                message = f"{message} {details}."
+
+            st.warning(message)
 else:
     up = st.sidebar.file_uploader("Upload CSV or JSON", type=["csv", "json"])
     if up is not None:
@@ -539,10 +620,6 @@ else:
 if not legs_df.empty:
     with st.expander("Raw legs (normalized)", expanded=False):
         st.dataframe(legs_df, use_container_width=True, hide_index=True)
-
-    if source == "FL3XX API" and "fl3xx_last_metadata" in st.session_state:
-        with st.expander("FL3XX fetch metadata", expanded=False):
-            st.json(st.session_state["fl3xx_last_metadata"])
 
     short_df = compute_short_turns(legs_df, threshold)
 
@@ -557,9 +634,18 @@ if not legs_df.empty:
         col_config = {
             "arr_onblock": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
             "dep_offblock": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
-            "turn_min": st.column_config.NumberColumn("Turn (min)", help="Minutes between ARR on-block and next DEP off-block at the same station", step=0.1),
+            "turn_min": st.column_config.NumberColumn(
+                "Turn (min)",
+                help="Minutes between ARR on-block and next DEP off-block at the same station",
+                step=0.1,
+            ),
         }
-        st.dataframe(short_df, use_container_width=True, hide_index=True, column_config=col_config)
+        st.dataframe(
+            short_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config=col_config,
+        )
 
         # Download
         csv = short_df.to_csv(index=False)
@@ -572,7 +658,16 @@ if not legs_df.empty:
 
         # Quick summary chips
         st.markdown("### Summary")
-        by_tail = short_df.groupby("tail").size().reset_index(name="count").sort_values("count", ascending=False)
+        by_tail = (
+            short_df.groupby("tail")
+            .size()
+            .reset_index(name="count")
+            .sort_values("count", ascending=False)
+        )
         st.dataframe(by_tail, use_container_width=True, hide_index=True)
 else:
     st.info("Select a data source and load legs to see short turns.")
+
+if source == "FL3XX API" and "fl3xx_last_metadata" in st.session_state:
+    with st.expander("FL3XX fetch metadata", expanded=False):
+        st.json(st.session_state["fl3xx_last_metadata"])
