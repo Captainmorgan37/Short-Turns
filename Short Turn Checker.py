@@ -1,10 +1,11 @@
 import os
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pandas as pd
-import requests
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
+from fl3xx_api import Fl3xxApiConfig, fetch_flights
 
 # ----------------------------
 # App Config
@@ -55,60 +56,315 @@ def parse_dt(x):
 # ----------------------------
 # FL3XX Fetch (skeleton — adapt endpoint & mapping to your account)
 # ----------------------------
-@st.cache_data(show_spinner=True, ttl=120)
-def fetch_fl3xx_legs(token: str, start_utc: datetime, end_utc: datetime) -> pd.DataFrame:
-    """Fetch legs from FL3XX API and return a *normalized* DataFrame with columns:
-       [tail, dep_airport, dep_offblock, arr_airport, arr_onblock, leg_id]
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
-       NOTE: Replace the URL/path and mapping with your actual FL3XX endpoints/fields.
-    """
-    # ---- Replace this with your real endpoint(s) ----
-    # Example placeholder URL; FL3XX endpoints vary by tenant and version.
-    base_url = os.getenv("FL3XX_BASE_URL", "https://api.fl3xx.com/api/v1")
-    url = f"{base_url}/flights"  # <— adjust to your real resource (e.g., /legs, /schedule, etc.)
 
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
+def _get_nested(mapping, path):
+    if isinstance(path, str):
+        parts = path.split(".")
+    else:
+        parts = list(path)
+    current = mapping
+    for part in parts:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+        if current is None:
+            return None
+    return current
 
-    params = {
-        # Adjust parameter names to match FL3XX: e.g., from/to, dateFrom/dateTo, etc.
-        "from": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "to": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        # Include fields/filters as needed to limit payload size
-    }
 
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        st.error(f"FL3XX fetch failed: {e}")
-        return pd.DataFrame()
+def _first_stripped(*values):
+    for value in values:
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate:
+                return candidate
+        elif value is not None:
+            candidate = str(value).strip()
+            if candidate:
+                return candidate
+    return None
 
-    # ---- Map fields from FL3XX payload to our normalized schema ----
-    # The mapping below is an example. Update keys to match your API response structure.
+
+def _coerce_datetime(value):
+    if isinstance(value, (datetime, pd.Timestamp)):
+        return parse_dt(value)
+    if isinstance(value, str):
+        return parse_dt(value)
+    if isinstance(value, dict):
+        for key in (
+            "actual",
+            "actualTime",
+            "actualUTC",
+            "actualUtc",
+            "actualDateTime",
+            "scheduled",
+            "scheduledTime",
+            "scheduledUTC",
+            "scheduledUtc",
+            "scheduledDateTime",
+            "offBlock",
+            "offBlockActual",
+            "offBlockScheduled",
+            "out",
+            "outActual",
+            "outScheduled",
+            "in",
+            "inActual",
+            "inScheduled",
+        ):
+            if key in value:
+                dt = _coerce_datetime(value[key])
+                if dt is not pd.NaT:
+                    return dt
+        for sub_value in value.values():
+            dt = _coerce_datetime(sub_value)
+            if dt is not pd.NaT:
+                return dt
+        return pd.NaT
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            dt = _coerce_datetime(item)
+            if dt is not pd.NaT:
+                return dt
+    return pd.NaT
+
+
+def _extract_field(payload: dict, options):
+    for option in options:
+        value = _get_nested(payload, option)
+        if value is None:
+            continue
+        result = _first_stripped(value)
+        if result:
+            return result
+    return None
+
+
+def _normalise_flights(flights):
+    dep_time_keys = [
+        "scheduledOut",
+        "actualOut",
+        "outActual",
+        "outScheduled",
+        "offBlock",
+        "offBlockActual",
+        "offBlockScheduled",
+        "departureScheduledTime",
+        "departureActualTime",
+        "departureTimeScheduled",
+        "departureTimeActual",
+        "departureScheduledUtc",
+        "departureActualUtc",
+        "departure.scheduled",
+        "departure.actual",
+        "departure.scheduledTime",
+        "departure.actualTime",
+        "departure.scheduledUtc",
+        "departure.actualUtc",
+        "times.departure.scheduled",
+        "times.departure.actual",
+        "times.offBlock.scheduled",
+        "times.offBlock.actual",
+    ]
+
+    arr_time_keys = [
+        "scheduledIn",
+        "actualIn",
+        "inActual",
+        "inScheduled",
+        "onBlock",
+        "onBlockActual",
+        "onBlockScheduled",
+        "arrivalScheduledTime",
+        "arrivalActualTime",
+        "arrivalTimeScheduled",
+        "arrivalTimeActual",
+        "arrivalScheduledUtc",
+        "arrivalActualUtc",
+        "arrival.scheduled",
+        "arrival.actual",
+        "arrival.scheduledTime",
+        "arrival.actualTime",
+        "arrival.scheduledUtc",
+        "arrival.actualUtc",
+        "times.arrival.scheduled",
+        "times.arrival.actual",
+        "times.onBlock.scheduled",
+        "times.onBlock.actual",
+    ]
+
+    tail_keys = [
+        "aircraftRegistration",
+        "aircraft.registration",
+        "aircraft.reg",
+        "aircraft.tailNumber",
+        "aircraft.name",
+        "tailNumber",
+        "tail",
+        "registration",
+    ]
+
+    dep_airport_keys = [
+        "departureAirportIcao",
+        "departureAirport.icao",
+        "departure.airportIcao",
+        "departure.airport.icao",
+        "departureAirport",
+        "departure.icao",
+        "departure.airport",
+        "departureStation",
+    ]
+
+    arr_airport_keys = [
+        "arrivalAirportIcao",
+        "arrivalAirport.icao",
+        "arrival.airportIcao",
+        "arrival.airport.icao",
+        "arrivalAirport",
+        "arrival.icao",
+        "arrival.airport",
+        "arrivalStation",
+    ]
+
+    leg_id_keys = [
+        "flightId",
+        "id",
+        "uuid",
+        "legId",
+        "scheduleId",
+    ]
+
     rows = []
-    for item in (data if isinstance(data, list) else data.get("results", [])):
-        tail = item.get("aircraftRegistration") or item.get("tail")
-        dep_ap = item.get("departureAirportIcao") or item.get("depIcao") or item.get("departure")
-        arr_ap = item.get("arrivalAirportIcao") or item.get("arrIcao") or item.get("arrival")
-        dep_off = parse_dt(item.get("scheduledOut") or item.get("outTime") or item.get("offBlock"))
-        arr_on = parse_dt(item.get("scheduledIn") or item.get("inTime") or item.get("onBlock"))
-        leg_id = item.get("id") or item.get("legId") or item.get("uuid")
-        if tail and dep_ap and arr_ap and (dep_off is not pd.NaT or arr_on is not pd.NaT):
-            rows.append({
+    for flight in flights:
+        if not isinstance(flight, dict):
+            continue
+        tail = _extract_field(flight, tail_keys)
+        dep_ap = _extract_field(flight, dep_airport_keys)
+        arr_ap = _extract_field(flight, arr_airport_keys)
+        dep_time = _extract_datetime(flight, dep_time_keys)
+        arr_time = _extract_datetime(flight, arr_time_keys)
+        leg_id = _extract_field(flight, leg_id_keys)
+
+        if tail:
+            tail = tail.upper()
+        if dep_ap:
+            dep_ap = dep_ap.upper()
+        if arr_ap:
+            arr_ap = arr_ap.upper()
+
+        if not tail or not dep_ap or not arr_ap:
+            continue
+
+        if dep_time is pd.NaT:
+            dep_time = None
+        if arr_time is pd.NaT:
+            arr_time = None
+
+        if dep_time is None and arr_time is None:
+            continue
+
+        rows.append(
+            {
                 "tail": tail,
                 "dep_airport": dep_ap,
                 "arr_airport": arr_ap,
-                "dep_offblock": dep_off,
-                "arr_onblock": arr_on,
+                "dep_offblock": dep_time,
+                "arr_onblock": arr_time,
                 "leg_id": leg_id,
-            })
+            }
+        )
 
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
+
+
+def _extract_datetime(payload: dict, options):
+    for option in options:
+        value = _get_nested(payload, option)
+        if value is None:
+            continue
+        dt = _coerce_datetime(value)
+        if dt is not pd.NaT:
+            return dt
+    return None
+
+
+def _build_fl3xx_config(token: str) -> Fl3xxApiConfig:
+    secrets_section = st.secrets.get("fl3xx_api", {})
+
+    base_url = secrets_section.get("base_url") or os.getenv("FL3XX_BASE_URL") or Fl3xxApiConfig().base_url
+
+    auth_header_name = secrets_section.get("auth_header_name") or os.getenv("FL3XX_AUTH_HEADER", "Authorization")
+
+    auth_header = secrets_section.get("auth_header") or os.getenv("FL3XX_AUTH_HEADER_VALUE")
+
+    api_token_scheme = secrets_section.get("api_token_scheme") or os.getenv("FL3XX_TOKEN_SCHEME")
+
+    extra_headers = {}
+    if "extra_headers" in secrets_section and isinstance(secrets_section["extra_headers"], dict):
+        extra_headers = dict(secrets_section["extra_headers"])
+
+    extra_params = {}
+    if "extra_params" in secrets_section and isinstance(secrets_section["extra_params"], dict):
+        extra_params = dict(secrets_section["extra_params"])
+
+    verify_ssl = secrets_section.get("verify_ssl")
+    if verify_ssl is None:
+        verify_ssl = os.getenv("FL3XX_VERIFY_SSL")
+    verify_ssl = True if verify_ssl is None else _coerce_bool(verify_ssl)
+
+    timeout = secrets_section.get("timeout") or os.getenv("FL3XX_TIMEOUT")
+    if timeout is not None:
+        try:
+            timeout = int(timeout)
+        except (TypeError, ValueError):
+            timeout = None
+
+    config_kwargs = {
+        "base_url": base_url,
+        "api_token": token or secrets_section.get("api_token"),
+        "auth_header": auth_header,
+        "auth_header_name": auth_header_name,
+        "api_token_scheme": api_token_scheme,
+        "extra_headers": extra_headers,
+        "extra_params": extra_params,
+        "verify_ssl": verify_ssl,
+    }
+
+    if timeout is not None:
+        config_kwargs["timeout"] = timeout
+
+    return Fl3xxApiConfig(**config_kwargs)
+
+
+@st.cache_data(show_spinner=True, ttl=180)
+def fetch_fl3xx_legs(token: str, start_utc: datetime, end_utc: datetime) -> pd.DataFrame:
+    """Fetch FL3XX flights and normalise them into the dataframe the app expects."""
+
+    config = _build_fl3xx_config(token)
+
+    if not (config.api_token or config.auth_header):
+        st.error("No FL3XX API token found. Provide a token or configure it in Streamlit secrets.")
+        return pd.DataFrame()
+
+    from_date = start_utc.date()
+    to_date = (end_utc + timedelta(days=1)).date()
+
+    try:
+        flights, metadata = fetch_flights(config, from_date=from_date, to_date=to_date)
+    except Exception as exc:
+        st.error(f"FL3XX fetch failed: {exc}")
+        return pd.DataFrame()
+
+    st.session_state["fl3xx_last_metadata"] = {"count": len(flights), **metadata}
+
+    return _normalise_flights(flights)
 
 # ----------------------------
 # Upload parser (CSV/JSON) — expects the columns listed above, but will try to infer
@@ -230,9 +486,17 @@ end_utc = end_local.astimezone(ZoneInfo("UTC"))
 # ----------------------------
 legs_df = pd.DataFrame()
 
+if source != "FL3XX API":
+    st.session_state.pop("fl3xx_last_metadata", None)
+
 if source == "FL3XX API":
     st.sidebar.subheader("FL3XX Auth")
-    token = st.sidebar.text_input("API Token (or set ST_SECRETS)", value=st.secrets.get("FL3XX_TOKEN", ""), type="password")
+    default_token = ""
+    if "fl3xx_api" in st.secrets:
+        default_token = st.secrets["fl3xx_api"].get("api_token", "")
+    if not default_token:
+        default_token = st.secrets.get("FL3XX_TOKEN", "")
+    token = st.sidebar.text_input("API Token (or set ST_SECRETS)", value=default_token, type="password")
     fetch_btn = st.sidebar.button("Fetch from FL3XX", type="primary")
     if fetch_btn:
         legs_df = fetch_fl3xx_legs(token, start_utc, end_utc)
@@ -249,6 +513,10 @@ else:
 if not legs_df.empty:
     with st.expander("Raw legs (normalized)", expanded=False):
         st.dataframe(legs_df, use_container_width=True, hide_index=True)
+
+    if source == "FL3XX API" and "fl3xx_last_metadata" in st.session_state:
+        with st.expander("FL3XX fetch metadata", expanded=False):
+            st.json(st.session_state["fl3xx_last_metadata"])
 
     short_df = compute_short_turns(legs_df, threshold)
 
