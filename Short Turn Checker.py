@@ -354,7 +354,7 @@ def fetch_fl3xx_legs(token: str, start_utc: datetime, end_utc: datetime) -> pd.D
         return pd.DataFrame()
 
     from_date = start_utc.date()
-    to_date = (end_utc + timedelta(days=1)).date()
+    to_date = end_utc.date()
 
     try:
         flights, metadata = fetch_flights(config, from_date=from_date, to_date=to_date)
@@ -471,15 +471,38 @@ st.sidebar.header("Data Source")
 source = st.sidebar.radio("Choose source", ["FL3XX API", "Upload CSV/JSON"], index=0)
 threshold = st.sidebar.number_input("Short-turn threshold (minutes)", min_value=5, max_value=240, value=DEFAULT_TURN_THRESHOLD_MIN, step=5)
 
-# Date selector defaults: night shift usually looks at "tomorrow"
+# Date selector defaults: night shift usually looks at "tomorrow" for the next few days
 local_today = datetime.now(LOCAL_TZ).date()
-def_date = local_today + timedelta(days=1)
-sel_date = st.sidebar.date_input("Date (local)", value=def_date)
+default_start = local_today + timedelta(days=1)
+default_end = default_start + timedelta(days=4)
+selected_dates = st.sidebar.date_input(
+    "Date range (local)",
+    value=(default_start, default_end),
+)
 
-start_local = datetime.combine(sel_date, datetime.min.time()).replace(tzinfo=LOCAL_TZ)
-end_local = start_local + timedelta(days=1)
+if isinstance(selected_dates, list):
+    selected_dates = tuple(selected_dates)
+
+if not selected_dates:
+    start_date, end_date = default_start, default_end
+elif isinstance(selected_dates, tuple):
+    if len(selected_dates) == 2:
+        start_date, end_date = selected_dates
+    elif len(selected_dates) == 1:
+        start_date = end_date = selected_dates[0]
+    else:
+        start_date = end_date = default_start
+else:
+    start_date = end_date = selected_dates
+
+if start_date > end_date:
+    start_date, end_date = end_date, start_date
+
+start_local = datetime.combine(start_date, datetime.min.time(), tzinfo=LOCAL_TZ)
+end_local = datetime.combine(end_date + timedelta(days=1), datetime.min.time(), tzinfo=LOCAL_TZ)
 start_utc = start_local.astimezone(ZoneInfo("UTC"))
 end_utc = end_local.astimezone(ZoneInfo("UTC"))
+window_label = f"{start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}"
 
 # ----------------------------
 # Load Data
@@ -501,7 +524,10 @@ if source == "FL3XX API":
     if fetch_btn:
         legs_df = fetch_fl3xx_legs(token, start_utc, end_utc)
         if legs_df.empty:
-            st.warning("No legs returned. Check your endpoint/mapping and date range.")
+            st.warning(
+                "No legs returned. Check your endpoint/mapping and date range "
+                f"({window_label})."
+            )
 else:
     up = st.sidebar.file_uploader("Upload CSV or JSON", type=["csv", "json"])
     if up is not None:
@@ -520,10 +546,12 @@ if not legs_df.empty:
 
     short_df = compute_short_turns(legs_df, threshold)
 
-    st.subheader(f"Short turns under {threshold} min for {sel_date.strftime('%Y-%m-%d')} ({LOCAL_TZ.key})")
+    st.subheader(
+        f"Short turns under {threshold} min for {window_label} ({LOCAL_TZ.key})"
+    )
 
     if short_df.empty:
-        st.success("No short turns found in the selected window. 🎉")
+        st.success(f"No short turns found in the selected window ({window_label}). 🎉")
     else:
         # Nice column formatting
         col_config = {
@@ -535,7 +563,12 @@ if not legs_df.empty:
 
         # Download
         csv = short_df.to_csv(index=False)
-        st.download_button("Download CSV", csv, file_name=f"short_turns_{sel_date.strftime('%Y%m%d')}.csv", mime="text/csv")
+        st.download_button(
+            "Download CSV",
+            csv,
+            file_name=f"short_turns_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+        )
 
         # Quick summary chips
         st.markdown("### Summary")
