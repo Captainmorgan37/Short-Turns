@@ -1,0 +1,277 @@
+import os
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+import pandas as pd
+import requests
+import streamlit as st
+from streamlit_autorefresh import st_autorefresh
+
+# ----------------------------
+# App Config
+# ----------------------------
+st.set_page_config(page_title="Short Turns Highlighter", layout="wide")
+st.title("✈️ Short Turns — Lightweight Viewer")
+
+# Auto-refresh every 3 minutes (disable with 0)
+st_autorefresh(interval=180 * 1000, key="refresh_short_turns")
+
+LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "America/Edmonton"))
+DEFAULT_TURN_THRESHOLD_MIN = int(os.getenv("TURN_THRESHOLD_MIN", "45"))
+
+# ----------------------------
+# Helper: Normalize / Parse datetimes
+# ----------------------------
+def parse_dt(x):
+    if pd.isna(x) or x == "":
+        return pd.NaT
+    if isinstance(x, (pd.Timestamp, datetime)):
+        return pd.to_datetime(x)
+    # Try multiple formats
+    for fmt in (None, "%Y-%m-%d %H:%M:%S%z", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return pd.to_datetime(x, format=fmt, utc=True).tz_convert(LOCAL_TZ) if fmt else pd.to_datetime(x, utc=True).tz_convert(LOCAL_TZ)
+        except Exception:
+            continue
+    # Last resort
+    try:
+        return pd.to_datetime(x, utc=True).tz_convert(LOCAL_TZ)
+    except Exception:
+        return pd.NaT
+
+# ----------------------------
+# Data Model we need
+# ----------------------------
+# Minimal normalized columns required for the turn calculation:
+#   tail: str (aircraft reg)
+#   station: str (ICAO where the turn happens; typically ARR airport of leg N and DEP airport of leg N+1)
+#   arr_onblock: datetime (actual or scheduled on-block for arriving leg)
+#   dep_offblock_next: datetime (actual or scheduled off-block for next departing leg from same station)
+#   arr_leg_id / dep_leg_id: identifiers (optional but helpful)
+#
+# The app provides two input paths:
+#   1) Direct FL3XX API fetch (configure below in fetch_fl3xx_legs)
+#   2) Upload CSV/JSON already exported by your FF Dashboard or FL3XX
+
+# ----------------------------
+# FL3XX Fetch (skeleton — adapt endpoint & mapping to your account)
+# ----------------------------
+@st.cache_data(show_spinner=True, ttl=120)
+def fetch_fl3xx_legs(token: str, start_utc: datetime, end_utc: datetime) -> pd.DataFrame:
+    """Fetch legs from FL3XX API and return a *normalized* DataFrame with columns:
+       [tail, dep_airport, dep_offblock, arr_airport, arr_onblock, leg_id]
+
+       NOTE: Replace the URL/path and mapping with your actual FL3XX endpoints/fields.
+    """
+    # ---- Replace this with your real endpoint(s) ----
+    # Example placeholder URL; FL3XX endpoints vary by tenant and version.
+    base_url = os.getenv("FL3XX_BASE_URL", "https://api.fl3xx.com/api/v1")
+    url = f"{base_url}/flights"  # <— adjust to your real resource (e.g., /legs, /schedule, etc.)
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+    }
+
+    params = {
+        # Adjust parameter names to match FL3XX: e.g., from/to, dateFrom/dateTo, etc.
+        "from": start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "to": end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        # Include fields/filters as needed to limit payload size
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        st.error(f"FL3XX fetch failed: {e}")
+        return pd.DataFrame()
+
+    # ---- Map fields from FL3XX payload to our normalized schema ----
+    # The mapping below is an example. Update keys to match your API response structure.
+    rows = []
+    for item in (data if isinstance(data, list) else data.get("results", [])):
+        tail = item.get("aircraftRegistration") or item.get("tail")
+        dep_ap = item.get("departureAirportIcao") or item.get("depIcao") or item.get("departure")
+        arr_ap = item.get("arrivalAirportIcao") or item.get("arrIcao") or item.get("arrival")
+        dep_off = parse_dt(item.get("scheduledOut") or item.get("outTime") or item.get("offBlock"))
+        arr_on = parse_dt(item.get("scheduledIn") or item.get("inTime") or item.get("onBlock"))
+        leg_id = item.get("id") or item.get("legId") or item.get("uuid")
+        if tail and dep_ap and arr_ap and (dep_off is not pd.NaT or arr_on is not pd.NaT):
+            rows.append({
+                "tail": tail,
+                "dep_airport": dep_ap,
+                "arr_airport": arr_ap,
+                "dep_offblock": dep_off,
+                "arr_onblock": arr_on,
+                "leg_id": leg_id,
+            })
+
+    df = pd.DataFrame(rows)
+    return df
+
+# ----------------------------
+# Upload parser (CSV/JSON) — expects the columns listed above, but will try to infer
+# ----------------------------
+def load_uploaded(file) -> pd.DataFrame:
+    name = file.name.lower()
+    if name.endswith(".json"):
+        raw = pd.read_json(file)
+    else:
+        raw = pd.read_csv(file)
+
+    # Try to normalize column names
+    cols = {c.lower(): c for c in raw.columns}
+    def pick(*options):
+        for opt in options:
+            if opt in cols:
+                return cols[opt]
+        return None
+
+    tail_col = pick("tail", "aircraftregistration", "aircraft", "reg")
+    dep_ap_col = pick("dep_airport", "departureairporticao", "depicao", "departure")
+    arr_ap_col = pick("arr_airport", "arrivalairporticao", "arricao", "arrival")
+    dep_off_col = pick("dep_offblock", "scheduledout", "outtime", "offblock")
+    arr_on_col = pick("arr_onblock", "scheduledin", "intime", "onblock")
+    leg_id_col = pick("leg_id", "id", "legid", "uuid")
+
+    df = pd.DataFrame({
+        "tail": raw[tail_col] if tail_col else None,
+        "dep_airport": raw[dep_ap_col] if dep_ap_col else None,
+        "arr_airport": raw[arr_ap_col] if arr_ap_col else None,
+        "dep_offblock": raw[dep_off_col].apply(parse_dt) if dep_off_col else pd.NaT,
+        "arr_onblock": raw[arr_on_col].apply(parse_dt) if arr_on_col else pd.NaT,
+        "leg_id": raw[leg_id_col] if leg_id_col else None,
+    })
+    return df.dropna(subset=["tail"]) if "tail" in df else df
+
+# ----------------------------
+# Core: Compute Turns
+# ----------------------------
+def compute_short_turns(legs: pd.DataFrame, threshold_min: int) -> pd.DataFrame:
+    if legs.empty:
+        return pd.DataFrame(columns=[
+            "tail", "station", "arr_leg_id", "arr_onblock", "dep_leg_id", "dep_offblock", "turn_min"
+        ])
+
+    # Ensure dtypes
+    legs = legs.copy()
+    legs["dep_offblock"] = legs["dep_offblock"].apply(parse_dt)
+    legs["arr_onblock"] = legs["arr_onblock"].apply(parse_dt)
+
+    # We'll compute turns per tail per station: find next departure from the ARR station after ARR onblock
+    # Prepare two views: arrivals and departures
+    arrs = legs.dropna(subset=["arr_airport", "arr_onblock"]).copy()
+    arrs.rename(columns={"arr_airport": "station", "arr_onblock": "arr_onblock"}, inplace=True)
+
+    deps = legs.dropna(subset=["dep_airport", "dep_offblock"]).copy()
+    deps.rename(columns={"dep_airport": "station", "dep_offblock": "dep_offblock"}, inplace=True)
+
+    arrs = arrs[["tail", "station", "arr_onblock", "leg_id"]].rename(columns={"leg_id": "arr_leg_id"})
+    deps = deps[["tail", "station", "dep_offblock", "leg_id"]].rename(columns={"leg_id": "dep_leg_id"})
+
+    # Sort for asof merge (next departure after arrival)
+    arrs = arrs.sort_values(["tail", "station", "arr_onblock"]).reset_index(drop=True)
+    deps = deps.sort_values(["tail", "station", "dep_offblock"]).reset_index(drop=True)
+
+    # Merge by tail & station; for each arrival, find the FIRST departure strictly after arrival
+    short_turn_rows = []
+    # We'll iterate per (tail, station) to keep memory small
+    for (tail, station), arr_grp in arrs.groupby(["tail", "station"], sort=False):
+        dep_grp = deps[(deps["tail"] == tail) & (deps["station"] == station)]
+        if dep_grp.empty:
+            continue
+        dep_times = dep_grp["dep_offblock"].tolist()
+        dep_ids = dep_grp["dep_leg_id"].tolist()
+        for _, r in arr_grp.iterrows():
+            arr_t = r["arr_onblock"]
+            # find first dep time > arr_t
+            idx = next((i for i, t in enumerate(dep_times) if pd.notna(arr_t) and pd.notna(t) and t > arr_t), None)
+            if idx is None:
+                continue
+            dep_t = dep_times[idx]
+            dep_id = dep_ids[idx]
+            turn_min = (dep_t - arr_t).total_seconds() / 60.0
+            if turn_min < threshold_min:
+                short_turn_rows.append({
+                    "tail": tail,
+                    "station": station,
+                    "arr_leg_id": r.get("arr_leg_id"),
+                    "arr_onblock": arr_t,
+                    "dep_leg_id": dep_id,
+                    "dep_offblock": dep_t,
+                    "turn_min": round(turn_min, 1),
+                })
+
+    out = pd.DataFrame(short_turn_rows)
+    if not out.empty:
+        out = out.sort_values(["turn_min", "tail", "station"]).reset_index(drop=True)
+    return out
+
+# ----------------------------
+# UI — Sidebar Controls
+# ----------------------------
+st.sidebar.header("Data Source")
+source = st.sidebar.radio("Choose source", ["FL3XX API", "Upload CSV/JSON"], index=0)
+threshold = st.sidebar.number_input("Short-turn threshold (minutes)", min_value=5, max_value=240, value=DEFAULT_TURN_THRESHOLD_MIN, step=5)
+
+# Date selector defaults: night shift usually looks at "tomorrow"
+local_today = datetime.now(LOCAL_TZ).date()
+def_date = local_today + timedelta(days=1)
+sel_date = st.sidebar.date_input("Date (local)", value=def_date)
+
+start_local = datetime.combine(sel_date, datetime.min.time()).replace(tzinfo=LOCAL_TZ)
+end_local = start_local + timedelta(days=1)
+start_utc = start_local.astimezone(ZoneInfo("UTC"))
+end_utc = end_local.astimezone(ZoneInfo("UTC"))
+
+# ----------------------------
+# Load Data
+# ----------------------------
+legs_df = pd.DataFrame()
+
+if source == "FL3XX API":
+    st.sidebar.subheader("FL3XX Auth")
+    token = st.sidebar.text_input("API Token (or set ST_SECRETS)", value=st.secrets.get("FL3XX_TOKEN", ""), type="password")
+    fetch_btn = st.sidebar.button("Fetch from FL3XX", type="primary")
+    if fetch_btn:
+        legs_df = fetch_fl3xx_legs(token, start_utc, end_utc)
+        if legs_df.empty:
+            st.warning("No legs returned. Check your endpoint/mapping and date range.")
+else:
+    up = st.sidebar.file_uploader("Upload CSV or JSON", type=["csv", "json"])
+    if up is not None:
+        legs_df = load_uploaded(up)
+
+# ----------------------------
+# Compute & Display Short Turns
+# ----------------------------
+if not legs_df.empty:
+    with st.expander("Raw legs (normalized)", expanded=False):
+        st.dataframe(legs_df, use_container_width=True, hide_index=True)
+
+    short_df = compute_short_turns(legs_df, threshold)
+
+    st.subheader(f"Short turns under {threshold} min for {sel_date.strftime('%Y-%m-%d')} ({LOCAL_TZ.key})")
+
+    if short_df.empty:
+        st.success("No short turns found in the selected window. 🎉")
+    else:
+        # Nice column formatting
+        col_config = {
+            "arr_onblock": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
+            "dep_offblock": st.column_config.DatetimeColumn(format="YYYY-MM-DD HH:mm"),
+            "turn_min": st.column_config.NumberColumn("Turn (min)", help="Minutes between ARR on-block and next DEP off-block at the same station", step=0.1),
+        }
+        st.dataframe(short_df, use_container_width=True, hide_index=True, column_config=col_config)
+
+        # Download
+        csv = short_df.to_csv(index=False)
+        st.download_button("Download CSV", csv, file_name=f"short_turns_{sel_date.strftime('%Y%m%d')}.csv", mime="text/csv")
+
+        # Quick summary chips
+        st.markdown("### Summary")
+        by_tail = short_df.groupby("tail").size().reset_index(name="count").sort_values("count", ascending=False)
+        st.dataframe(by_tail, use_container_width=True, hide_index=True)
+else:
+    st.info("Select a data source and load legs to see short turns.")
