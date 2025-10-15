@@ -147,6 +147,15 @@ def _extract_field(payload: dict, options):
     return None
 
 
+def _is_placeholder_tail(tail: str) -> bool:
+    """Return ``True`` when the provided tail number is a placeholder."""
+
+    if not tail:
+        return False
+    first_word = tail.split()[0]
+    return first_word in {"ADD", "REMOVE"}
+
+
 def _normalise_flights(flights):
     """Return a dataframe of legs and diagnostics about skipped flights."""
 
@@ -155,6 +164,7 @@ def _normalise_flights(flights):
         "normalised": 0,
         "skipped_non_mapping": 0,
         "skipped_missing_tail": 0,
+        "skipped_placeholder_tail": 0,
         "skipped_missing_airports": 0,
         "skipped_missing_dep_airport": 0,
         "skipped_missing_arr_airport": 0,
@@ -217,6 +227,8 @@ def _normalise_flights(flights):
         "aircraftRegistration",
         "aircraft.registration",
         "aircraft.reg",
+        "aircraft.registrationNumber",
+        "registrationNumber",
         "aircraft.tailNumber",
         "aircraft.name",
         "tailNumber",
@@ -269,6 +281,9 @@ def _normalise_flights(flights):
 
         if tail:
             tail = tail.upper()
+            if _is_placeholder_tail(tail):
+                stats["skipped_placeholder_tail"] += 1
+                continue
         if dep_ap:
             dep_ap = dep_ap.upper()
         if arr_ap:
