@@ -3,7 +3,6 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 from fl3xx_api import Fl3xxApiConfig, fetch_flights
 
@@ -13,8 +12,16 @@ from fl3xx_api import Fl3xxApiConfig, fetch_flights
 st.set_page_config(page_title="Short Turns Highlighter", layout="wide")
 st.title("✈️ Short Turns — Lightweight Viewer")
 
-# Auto-refresh every 3 minutes (disable with 0)
-st_autorefresh(interval=180 * 1000, key="refresh_short_turns")
+
+def _purge_autorefresh_session_state() -> None:
+    """Remove stale session-state keys left behind by the old autorefresh widget."""
+
+    stale_keys = [key for key in st.session_state if "autorefresh" in key.lower()]
+    for key in stale_keys:
+        st.session_state.pop(key, None)
+
+
+_purge_autorefresh_session_state()
 
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "America/Edmonton"))
 DEFAULT_TURN_THRESHOLD_MIN = int(os.getenv("TURN_THRESHOLD_MIN", "45"))
